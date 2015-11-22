@@ -1,0 +1,1 @@
+echo 'Thu Sep  2 09:52:00 2004 50 192.168.20.10 896242 /home/test/file1.tgz b _ o r suporte ftp 0 * c' >> /tmp/xferlog

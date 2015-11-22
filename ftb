@@ -1,0 +1,236 @@
+#!/usr/bin/perl
+
+use Data::Dumper;
+use strict;
+use warnings;
+
+use DBI;
+use Getopt::Long;
+use Config::General;
+use POSIX qw/strftime/;;
+use Data::UUID;
+
+
+my $config = Config::General->new("config");
+my %config = $config->getall;
+
+my $debug = exists $config{Debug}?$config{Debug}:0;
+my $interactive;
+$interactive = 1 if exists $config{Interactive} && $config{Interactive} =~ /^true$/i;
+
+GetOptions(
+	"interactive|i"	=> \$interactive,
+	"debug|d"	=> \$debug,
+);
+
+use POE qw/Wheel::FollowTail Wheel::ReadLine/;
+
+my $ug = Data::UUID->new;
+
+#
+# Open DB
+#
+my $dbh;
+if($config{DataBaseType} eq "sqlite") {
+	unless ( exists $config{DataBaseFile} ) {
+		print "Missing configuration key DataBaseFile is required for SQLite\n";
+		exit 2;
+	}
+	$dbh = DBI->connect("dbi:SQLite:dbname=$config{DataBaseFile}", "", "");
+}
+
+sub ftb_initdb {
+	my $rv = $dbh->do(qq{
+		CREATE TABLE IF NOT EXISTS file_log (
+			entry_id INTEGER PRIMARY KEY ASC AUTOINCREMENT,
+			date INTEGER,
+			sender STRING,
+			path STRING,
+			tx_delta INTEGER,
+			size INTEGER,
+			mode STRING,
+			action string,
+			complete intger
+		);
+	});
+}
+
+sub ftb_help_main {
+	print qq{List of available commands. Type help <command> for specific command help.
+	show		show things (logs, etc...)
+	help [command]	this screen or help for a specific command
+	quit		exit interactive shell
+};
+}
+
+sub ftb_help_show {
+	print qq{show <something>
+	show log	show file transfer log
+	show history	show command history
+};
+}
+
+sub ftb_help {
+	my $args = shift || "";
+	if(!$args) {
+		ftb_help_main();
+	} elsif ( $args =~ /^show\s*$/ ) {
+		ftb_help_show()
+	}
+}
+
+sub ftb_show_log {
+	my $sth = $dbh->prepare('select * from file_log;');
+	$sth->execute;
+	while(my $row = $sth->fetchrow_hashref) {
+		printf "[ %s ] %s\n", scalar localtime $$row{date}, $$row{path};
+	}
+}
+
+sub ftb_show_history {
+	for my $entry (@_) {
+		printf "> $entry\n";
+	}
+}
+
+sub ftb_show {
+	my $args = shift || "";
+	return if !$args;
+
+	if( $args =~ /^log\s*$/ ) {
+		ftb_show_log();
+	}
+}
+
+ftb_initdb();
+
+sub xferlog_entry_parse {
+	print "START xferlog_entry_parse\n" if $debug >= 10;
+	my ($entry, $name, $xferlog) = @_;
+
+	#               wd      mon     day     time            year    delta   ip      size    path      mode     ?       action  ?       sender  proto   ?       ?       completion status
+	#               0       1       2       3               4       5       6       7       8         9        10      11      12      13      14      15      16      17
+	my $xferlog_re='(\w+)\s+(\w+)\s+(\d+)\s+(\d+:\d+:\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\S.*?)\s+([ba])\s+(\S+)\s+(\w+)\s+(\w+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\w+)';
+	if( my ($wday, $mon, $mday, $time, $year, $delta, $ip, $bytes, $path, $mode, $wtf1, $action, $wtf2, $sender, $proto, $wtf3, $wtf4, $completion_state) = $entry =~ /$xferlog_re/ ) {
+		my $sth = $dbh->prepare('INSERT INTO file_log ( date, sender, path, tx_delta, size, mode, action, complete ) VALUES ( ?, ?, ?, ?, ?, ?, ?, ?);');
+		$sth->execute(time, $sender, $path, $delta, $bytes, $mode, $action, $completion_state);
+	
+	my %rules = %{$config{LogWatch}{$xferlog}{Rules}} ;
+	for my $rule (sort keys %{ $rules{Match}} ) {
+		printf "	START MATCH RULE $rule\n" if $debug >= 10;
+		my $file = $1 if $rule =~ m{/?([^/]*)$};
+
+		if ( $entry =~ /$rule/ ) {
+			next if exists $rules{Match}{$rule}{RequireUser} && $sender ne $rules{Match}{$rule}{RequireUser};
+			if(exists $rules{Match}{$rule}{Actions}{MoveTo}) {
+				my $moveto = $rules{Match}{$rule}{Actions}{MoveTo};
+				$moveto =~ s/\&s\&/$file/g;
+				$moveto =~ s/\&date\&/strftime('%Y%m%d', localtime)/ge;
+				$moveto =~ s/\&timestamp\&/strftime('%Y%m%d%H%M%S', localtime)/ge;
+				$moveto =~ s/\&time\&/strftime('%H%M%S', localtime)/ge;
+				$moveto =~ s/\&uuid\&/lc($ug->create_str)/ge;
+				printf "		MATCH rule, moving %s to %s\n", $file, $moveto if $debug >= 10;
+			}
+		}
+		printf "	END MATCH RULE $rule\n" if $debug >= 10;
+	}
+	#print Dumper(\%rules); exit;
+	}
+	print "END xferlog_entry_parse\n" if $debug >= 10;
+
+}
+
+sub xferlog_watch_create {
+	my ($xferlog, $name) = @_;
+	POE::Session->create(
+		inline_states => {
+			_start => sub {
+
+			$_[HEAP]->{tailor} = POE::Wheel::FollowTail->new(
+				Filename	=> $_[ARG0],
+				InputEvent	=> 'xferlog_entry_parse',
+				ResetEvent	=> 'xferlog_rollover',
+				ErrorEvent	=> 'xferlog_error',
+				SeekBack	=> 0,
+			);
+			$_[HEAP]->{first} = 0;
+			$_[HEAP]->{watchname} = $config{LogWatch}{$name};
+		},
+		xferlog_entry_parse => sub { xferlog_entry_parse($_[ARG0], $name, $xferlog); },
+		xferlog_rollover => sub {
+		},
+		xferlog_error => sub {
+		},
+	},
+	args => [ $xferlog ],
+);
+
+}
+
+if( exists $config{LogWatch} ) {
+	for my $log (keys %{$config{LogWatch}} ) {
+		unless ( exists $config{LogWatch}{$log}{Name} ) {
+			print "Error: unnamed logwatch for $log\n";
+			exit 2;
+		}
+		next if $config{LogWatch}{$log}{Type} =~ /^ignore$/i;
+		if ($config{LogWatch}{$log}{Type} =~ /^xferlog$/i ) {
+			print "Create Session\n";
+			xferlog_watch_create($log, $config{LogWatch}{$log}{Name});
+		}
+	}
+}
+
+sub setup_console {
+	$_[HEAP]{console} = POE::Wheel::ReadLine->new(InputEvent => 'got_user_input');
+	$_[HEAP]{console}->read_history("./.ftb_history");
+	$_[HEAP]{console}->clear();
+	$_[HEAP]{console}->put( "Interactive mode! Ctrl+C or Ctrl+D exits." );
+	$_[HEAP]{console}->get("ftb> ");
+}
+
+sub handle_user_input {
+	my ($input, $exception) = @_[ARG0, ARG1];
+	my $console = $_[HEAP]{console};
+
+	# handle quit
+	if ( !defined $input || $input =~ /^\s*quit\s*/ ) {
+		$console->put("$exception caught.  B'bye!") if !defined $input;
+		$_[KERNEL]->signal($_[KERNEL], "UIDESTROY");
+		$console->write_history("./.ftb_history");
+		return;
+	}
+	# don't handle empty input
+	if ($input !~ /^(\s*)$/ ) {
+
+		# register into command history
+		$console->addhistory($input);
+
+
+		# handle help
+		if ($input =~ /^\s*help(?:\s*$|\s+(\S+))/) { if(defined $1) { ftb_help($1); } else { ftb_help() }; };
+
+		# handle show
+		if ($input =~ /^\s*show(?:\s*$|\s+(\S+))/) {
+			if(defined $1) {
+				my $thing = $1;
+				if( $thing =~ /history/ ) {
+					ftb_show_history($console->get_history);
+				} else {
+					ftb_show($thing);
+				}
+			} else { ftb_show() }; };
+	}
+
+	$console->get("ftb> ");
+}
+
+POE::Session->create(
+	inline_states => {
+		_start => \&setup_console,
+		got_user_input => \&handle_user_input,
+	},
+) if $interactive;
+
+POE::Kernel->run();
+exit(0);

@@ -1,0 +1,36 @@
+#!/usr/bin/perl
+
+use Event;
+use AnyEvent;
+use AnyEvent::Strict;
+use File::Tail;
+
+#require 'conf.pl';
+
+my $xferlog_entry_ready = AnyEvent->condvar;
+
+open XFERLOG,"tail -q -n 0 --max-unchanged-stats=5 -f /var/log/xferlog|";
+
+my $wait_for_xferlog = AnyEvent->io (
+	fh	=> \*XFERLOG,
+	poll	=> "r",
+	cb	=> sub {
+			$xferlog_entry = <XFERLOG>;
+			$xferlog_entry_ready->send( parse_xferlog($xferlog_entry) );
+		}
+);
+
+sub parse_xferlog {
+	# Sat Oct  3 06:21:25 2015 1 ::1 4 /home/teste/teste.txt b _ i r teste ftp 0 * c
+	my ($entry) = @_;
+	if( my @fields = $entry =~ /(\w+)\s+(\w+)\s+(\d+)\s+(\d+:\d+:\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\S.*?)\s+([ba])\s+(\S+)\s+(\w+)\s+(\w+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\w+)/ ) {
+	#if( my @fields = split /\s+/,$entry ) {
+		return \@fields
+	}
+}
+
+my @xferlog = @{$xferlog_entry_ready->recv};
+
+printf "Got file %s\n", $xferlog[8];
+
+loop();

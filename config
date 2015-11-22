@@ -1,0 +1,53 @@
+#
+# DataBase
+#
+
+# Supported types: sqlite (others may come in the future)
+DataBaseType sqlite
+
+# Database file (required for sqlite type)
+DataBaseFile ftb.sqlite
+
+#
+# Debug
+#
+
+# Debug level, >= 10 is the current maximum
+Debug 10
+
+# If it's to run in interactive mode
+Interactive false
+
+#
+# Log Watches follow a log file and do actions according to rules
+#
+# Place as many as you'd like.
+# Required tokens: Name, Type, Rules
+#
+# Supported types:
+#	* xferlog	- for standard xferlog files
+#	* ignore	- for debug purposes
+#
+# Supported Rules
+# 	Match pcre
+#
+
+<LogWatch /tmp/xferlog>
+	Name	xferlog1
+	Type	xferlog
+	ChRoot /opt/ft/home
+	<Rules>
+		<Match /home/test/file.*gz>
+			RequireUser	suporte
+			<Actions>
+				MoveTo	/tmp/zbr.&date&.&time&.&timestamp&.&uuid&
+			</Actions>
+		</Match>
+	</Rules>
+</LogWatch>
+
+<LogWatch /tmp/fubar>
+# this is just for debug purposes
+	Name	ignore1
+	Type	ignore
+</LogWatch>
